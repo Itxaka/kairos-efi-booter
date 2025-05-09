@@ -1,0 +1,1 @@
+/home/itxaka/projects/kairos-efi-booter/target/x86_64-unknown-uefi/release/efi-key-enroller.efi: /home/itxaka/projects/kairos-efi-booter/keys/db.auth /home/itxaka/projects/kairos-efi-booter/keys/kek.auth /home/itxaka/projects/kairos-efi-booter/keys/pk.auth /home/itxaka/projects/kairos-efi-booter/src/main.rs
