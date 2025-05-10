@@ -22,5 +22,5 @@ Cargo.lock
 .idea/
 
 OVMF_VARS.fd
-
+esp/
 keys/
