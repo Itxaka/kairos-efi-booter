@@ -6,27 +6,30 @@ KEYS_DIR := keys
 UUID := $(shell uuidgen)
 
 
+ARCH := $(shell uname -m)
 .PHONY: all
 
 all: clean generate-keys build-efi
 
 build-efi:
+	@echo "[*] Building for $(TARGET)"
+	@rustup target add $(TARGET)
 	@cargo build --target $(TARGET) --release
 	@mkdir -p $(dir $(OUT_EFI))
 	@cp $(BUILD_DIR)/efi-key-enroller.efi $(OUT_EFI)
 clean:
-	@cargo clean
+	#@cargo clean
 	@rm -Rf $(ESP_DIR)
 	@rm -Rf $(KEYS_DIR)
 
 run-qemu:
 	cp OVMF_VARS.fd.clean OVMF_VARS.fd
-	qemu-system-x86_64 -enable-kvm -m 4G --machine q35 \
+	qemu-system-x86_64 $(if $(filter x86_64,$(ARCH)),-enable-kvm) -m 4G --machine q35 \
 	-drive if=pflash,format=raw,readonly=on,file=${PWD}/OVMF_CODE.fd \
   	-drive if=pflash,format=raw,file=${PWD}/OVMF_VARS.fd \
 	-drive file=fat:rw:./$(ESP_DIR)/,format=raw,media=disk -rtc base=utc \
 	-netdev bridge,id=net0,br=virbr0 \
-    -device e1000,netdev=net0
+    -device e1000,netdev=net0 -nographic
 
 generate-keys:
 	@rm -rf $(KEYS_DIR)
