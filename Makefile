@@ -8,13 +8,15 @@ UUID := $(shell uuidgen)
 
 .PHONY: all
 
-all: clean generate-keys build-efi
+all: clean build-efi
 
 build-efi:
+	@echo "[*] Building EFI application"
 	@cargo build --target $(TARGET) --release
 	@mkdir -p $(dir $(OUT_EFI))
 	@cp $(BUILD_DIR)/efi-key-enroller.efi $(OUT_EFI)
 clean:
+	@echo "[*] Cleaning up build artifacts"
 	@cargo clean
 	@rm -Rf $(ESP_DIR)
 	@rm -Rf $(KEYS_DIR)
@@ -27,6 +29,14 @@ run-qemu:
 	-drive file=fat:rw:./$(ESP_DIR)/,format=raw,media=disk -rtc base=utc \
 	-netdev bridge,id=net0,br=virbr0 \
     -device e1000,netdev=net0 -nographic
+
+run-qemu-network:
+	cp OVMF_VARS.fd.clean OVMF_VARS.fd
+	qemu-system-x86_64 -m 4G --machine q35 \
+	-drive if=pflash,format=raw,readonly=on,file=${PWD}/OVMF_CODE.fd \
+	-drive if=pflash,format=raw,file=${PWD}/OVMF_VARS.fd \
+	-netdev bridge,id=net0,br=virbr0 \
+	-device e1000,netdev=net0 -nographic
 
 generate-keys:
 	@rm -rf $(KEYS_DIR)
