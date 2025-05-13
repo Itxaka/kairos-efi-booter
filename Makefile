@@ -21,12 +21,12 @@ clean:
 
 run-qemu:
 	cp OVMF_VARS.fd.clean OVMF_VARS.fd
-	qemu-system-x86_64 -enable-kvm -m 4G --machine q35 \
+	qemu-system-x86_64 -m 4G --machine q35 \
 	-drive if=pflash,format=raw,readonly=on,file=${PWD}/OVMF_CODE.fd \
   	-drive if=pflash,format=raw,file=${PWD}/OVMF_VARS.fd \
 	-drive file=fat:rw:./$(ESP_DIR)/,format=raw,media=disk -rtc base=utc \
 	-netdev bridge,id=net0,br=virbr0 \
-    -device e1000,netdev=net0
+    -device e1000,netdev=net0 -nographic
 
 generate-keys:
 	@rm -rf $(KEYS_DIR)

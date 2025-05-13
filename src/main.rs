@@ -4,27 +4,22 @@ extern crate alloc;
 #[global_allocator]
 static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 
+use alloc::format;
 use log::info;
 use uefi::prelude::*;
 use uefi::CStr16;
 use uefi::runtime::{self, ResetType, VariableAttributes, VariableVendor};
-use uefi::{
-    Status,
-};
+use uefi::Status;
+use alloc::vec::Vec;
+use uefi::boot;
+use uefi::proto::network::ip4config2::Ip4Config2;
 
-
-// Embedded keys
-const PK: &[u8] = include_bytes!("../keys/PK.auth");
-const KEK: &[u8] = include_bytes!("../keys/KEK.auth");
-const DB: &[u8] = include_bytes!("../keys/DB.auth");
-
-
+const KEY_SERVER: &str = "http://192.168.122.1/";
 
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
     info!("Booting key enroller...");
-
     if is_setup_mode() {
         info!("Setup Mode detected. Enrolling keys...");
         if let Err(e) = enroll_all_keys() {
@@ -53,9 +48,20 @@ fn is_setup_mode() -> bool {
 }
 
 fn enroll_all_keys() -> Result<(), uefi::Status> {
-    enroll_key("PK", PK)?;
-    enroll_key("KEK", KEK)?;
-    enroll_key("db", DB)?;
+    let pk_url = format!("{}PK.auth", KEY_SERVER);
+    let kek_url = format!("{}KEK.auth", KEY_SERVER);
+    let db_url = format!("{}DB.auth", KEY_SERVER);
+
+    info!("Downloading PK...");
+    let pk = http_download(&pk_url)?;
+    info!("Downloading KEK...");
+    let kek = http_download(&kek_url)?;
+    info!("Downloading db...");
+    let db = http_download(&db_url)?;
+
+    enroll_key("PK", &pk)?;
+    enroll_key("KEK", &kek)?;
+    enroll_key("db", &db)?;
     Ok(())
 }
 
@@ -80,3 +86,34 @@ fn enroll_key(name: &str, data: &[u8]) -> Result<(), Status> {
         data,
     ).map_err(|e| e.status())
 }
+
+fn http_download(url: &str) -> Result<Vec<u8>, Status> {
+    let nic_handle = boot::get_handle_for_protocol::<uefi::proto::network::http::HttpBinding>()
+        .map_err(|e| e.status())?;
+
+    // Bring up the network interface (DHCP)
+    {
+        let mut ip4 = Ip4Config2::new(nic_handle)
+            .map_err(|e| e.status())?;
+        ip4.ifup(false).map_err(|e| e.status())?;
+
+        // Print IP configuration after DHCP
+        if let Ok(info) = ip4.get_interface_info() {
+            let hw = &info.hw_addr;
+            log::info!(
+                "IP config: addr {}.{}.{}.{}, mask {}.{}.{}.{}, hw_addr {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                info.station_addr.0[0], info.station_addr.0[1], info.station_addr.0[2], info.station_addr.0[3],
+                info.subnet_mask.0[0], info.subnet_mask.0[1], info.subnet_mask.0[2], info.subnet_mask.0[3],
+                hw.0[0], hw.0[1], hw.0[2], hw.0[3], hw.0[4], hw.0[5]
+            );
+        }
+    }
+
+    let mut http = uefi::proto::network::http::HttpHelper::new(nic_handle)
+        .map_err(|e| e.status())?;
+    http.configure().map_err(|e| e.status())?;
+    http.request_get(url).map_err(|e| e.status())?;
+    let resp = http.response_first(true).map_err(|e| e.status())?;
+    Ok(resp.body)
+}
+
