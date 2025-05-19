@@ -6,7 +6,7 @@ static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use log::info;
+use log::{info, LevelFilter};
 use uefi::prelude::*;
 use uefi::CStr16;
 use uefi::runtime::{self, ResetType, VariableAttributes, VariableVendor};
@@ -20,6 +20,10 @@ use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet};
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
+    
+    // Set the log level to only show INFO logs and above (suppress DEBUG logs)
+    log::set_max_level(LevelFilter::Info);
+
     info!("Booting key enroller...");
 
     // Setup network interface once
@@ -121,7 +125,27 @@ fn enroll_key(name: &str, data: &[u8]) -> Result<(), Status> {
     };
 
     info!("Setting var '{}', vendor: {:?}, size: {}", name, vendor, data.len());
-    runtime::set_variable(
+    
+    // Log the first few and last few bytes of the data for debugging
+    if !data.is_empty() {
+        let prefix_len = core::cmp::min(16, data.len());
+        let suffix_start = if data.len() > 16 { data.len() - 16 } else { 0 };
+        
+        let mut prefix_str = String::new();
+        for byte in &data[0..prefix_len] {
+            prefix_str.push_str(&format!("{:02x} ", byte));
+        }
+        
+        let mut suffix_str = String::new();
+        if data.len() > 16 {
+            suffix_str.push_str("... ");
+            for byte in &data[suffix_start..] {
+                suffix_str.push_str(&format!("{:02x} ", byte));
+            }
+        }
+    }
+    
+    let result = runtime::set_variable(
         name_utf16,
         vendor,
         VariableAttributes::NON_VOLATILE
@@ -129,7 +153,13 @@ fn enroll_key(name: &str, data: &[u8]) -> Result<(), Status> {
             | VariableAttributes::RUNTIME_ACCESS
             | VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
         data,
-    ).map_err(|e| e.status())
+    );
+    
+    if let Err(ref e) = result {
+        info!("set_variable for '{}' failed with status: {:?}", name, e.status());
+    }
+    
+    result.map_err(|e| e.status())
 }
 
 fn setup_network_interface() -> Result<(), Status> {
@@ -155,28 +185,103 @@ fn setup_network_interface() -> Result<(), Status> {
 }
 
 fn http_download(url: &str) -> Result<Vec<u8>, Status> {
+    info!("Starting HTTP download from {}", url);
     let nic_handle = boot::get_handle_for_protocol::<uefi::proto::network::http::HttpBinding>()
         .map_err(|e| e.status())?;
 
-    // Network interface setup is now done once in setup_network_interface()
     let mut http = uefi::proto::network::http::HttpHelper::new(nic_handle)
         .map_err(|e| e.status())?;
     http.configure().map_err(|e| e.status())?;
+    
+    // Send the HTTP GET request
     http.request_get(url).map_err(|e| e.status())?;
-    let resp = http.response_first(true).map_err(|e| e.status())?;
+    
+    // Get the first part of the response (includes headers and initial body chunk)
+    let resp = http.response_first(true).map_err(|e| {
+        info!("HTTP response_first failed: {:?}", e);
+        e.status()
+    })?;
 
-    // --- Added error/status checks below ---
-    // Compare status as integer since HttpStatusCode is private
-    if resp.status.0 != 200 {
-        info!("HTTP GET failed: status code {}", resp.status.0);
-        return Err(Status::DEVICE_ERROR);
+    // Check HTTP status code (3 is STATUS_200_OK in the HttpStatusCode enum)
+    if resp.status.0 != 3 { // STATUS_200_OK
+        info!("HTTP GET failed: non-success status code {:?}", resp.status);
+        return Err(Status::PROTOCOL_ERROR);
     }
-    if resp.body.is_empty() {
+
+    // Log headers and look for Content-Length
+    let mut content_length: Option<usize> = None;
+    for (name, value) in &resp.headers {
+        info!("  {}: {}", name, value);
+        if name.to_lowercase() == "content-length" {
+            if let Ok(len) = value.parse::<usize>() {
+                content_length = Some(len);
+                info!("Found Content-Length: {} bytes", len);
+            }
+        }
+    }
+
+    // Start with the initial body chunk
+    let mut full_body = resp.body;
+    
+    // Try to get more data until we have the complete file or no more data is available
+    let mut chunk_count = 1;
+    loop {
+        // Try to get more body data
+        match http.response_more() {
+            Ok(more_data) => {
+                if more_data.is_empty() {
+                    break;
+                }
+                
+                chunk_count += 1;
+                full_body.extend_from_slice(&more_data);
+                
+                // Log progress if Content-Length is known
+                if let Some(total) = content_length {
+                    info!("Progress: {}/{} bytes ({:.1}%)", 
+                          full_body.len(), total, 
+                          (full_body.len() as f32 / total as f32) * 100.0);
+                    
+                    // If we've received all the data, we're done
+                    if full_body.len() >= total {
+                        info!("Download complete, received all {} bytes", full_body.len());
+                        break;
+                    }
+                }
+            },
+            Err(e) => {
+                // NOT_FOUND typically means no more data is available
+                if e.status() == Status::NOT_FOUND {
+                    info!("No more data available");
+                } else {
+                    info!("Error fetching additional data: {:?}", e);
+                }
+                break;
+            }
+        }
+        
+        // Safety check to prevent infinite loops
+        if chunk_count > 50 {
+            info!("Reached maximum chunk count, stopping download");
+            break;
+        }
+    }
+    
+    if full_body.is_empty() {
         info!("HTTP GET succeeded but response body is empty");
-        return Err(Status::NOT_FOUND);
+        return Err(Status::NO_RESPONSE);
     }
-    // --- End added checks ---
-    Ok(resp.body)
+    
+    // Warn if download might be incomplete based on Content-Length
+    if let Some(expected) = content_length {
+        if full_body.len() < expected {
+            info!("Warning: Incomplete download. Got {}/{} bytes", full_body.len(), expected);
+        }
+    }
+    
+    info!("HTTP download complete for {}. Total size: {} bytes in {} chunks", url, full_body.len(), chunk_count);
+    
+    Ok(full_body)
 }
 
 /// Sends a DHCP request to discover PXE server information and returns the next boot server address
