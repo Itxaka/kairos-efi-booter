@@ -4,6 +4,7 @@ extern crate alloc;
 #[global_allocator]
 static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 
+use alloc::fmt::format;
 use alloc::format;
 use alloc::string::{String, ToString};
 use log::{info, LevelFilter};
@@ -15,23 +16,25 @@ use alloc::vec::Vec;
 use uefi::boot;
 use uefi::proto::network::ip4config2::Ip4Config2;
 use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet};
+use uefi::proto::device_path::DevicePath;
 
 
 #[entry]
-fn main() -> Status {
+unsafe fn main() -> Status {
     uefi::helpers::init().unwrap();
-    
-    // Set the log level to only show INFO logs and above (suppress DEBUG logs)
     log::set_max_level(LevelFilter::Info);
 
+    // Setup network interface and get NIC handle
+    let nic_handle = match setup_network_interface() {
+        Ok(h) => h,
+        Err(e) => {
+            info!("Failed to set up network interface: {:?}", e);
+            boot::stall(5_000_000);
+            runtime::reset(ResetType::COLD, Status::ABORTED, None);
+        }
+    };
+    
     info!("Booting key enroller...");
-
-    // Setup network interface once
-    if let Err(e) = setup_network_interface() {
-        info!("Failed to setup network interface: {:?}", e);
-        boot::stall(5_000_000);
-        runtime::reset(ResetType::COLD, Status::ABORTED, None);
-    }
 
     // Try to request DHCP information to find PXE server info
     let server = match request_dhcp_info() {
@@ -58,8 +61,18 @@ fn main() -> Status {
         info!("Not in setup mode, skipping key enrollment");
     }
 
+    // Add HTTP boot entry using the NIC device path
+    add_http_boot_entry(
+        nic_handle,
+        format!("http://{}/bootx64.efi", server).as_str(),
+        "Kairos installer",
+    ).unwrap_or_else(|e| {
+        info!("Failed to add HTTP boot entry: {:?}", e);
+        boot::stall(10_000_000);
+        runtime::reset(ResetType::COLD, Status::ABORTED, None);
+    });
     boot::stall(5_000_000);
-    Status::SUCCESS
+    runtime::reset(ResetType::COLD, Status::ABORTED, None);
 }
 
 
@@ -99,6 +112,7 @@ fn enroll_all_keys(server: &str) -> Result<(), Status> {
         }
     };
     info!("Downloading db from {}...", db_url);
+    // TODO: Fall back to db instead of DB??
     let db = match http_download(&db_url) {
         Ok(data) => data,
         Err(e) => {
@@ -162,7 +176,7 @@ fn enroll_key(name: &str, data: &[u8]) -> Result<(), Status> {
     result.map_err(|e| e.status())
 }
 
-fn setup_network_interface() -> Result<(), Status> {
+fn setup_network_interface() -> Result<uefi::Handle, Status> {
     info!("Setting up network interface...");
     let nic_handle = boot::get_handle_for_protocol::<uefi::proto::network::http::HttpBinding>()
         .map_err(|e| e.status())?;
@@ -181,7 +195,7 @@ fn setup_network_interface() -> Result<(), Status> {
             hw.0[0], hw.0[1], hw.0[2], hw.0[3], hw.0[4], hw.0[5]
         );
     }
-    Ok(())
+    Ok(nic_handle)
 }
 
 fn http_download(url: &str) -> Result<Vec<u8>, Status> {
@@ -416,4 +430,156 @@ pub fn request_dhcp_info() -> Option<String> {
     
     info!("Could not determine boot server from DHCP information");
     None
+}
+
+/// Adds a UEFI boot entry for HTTP(S) boot to the given URL with the provided description.
+unsafe fn add_http_boot_entry(nic_handle: uefi::Handle, url: &str, description: &str) -> Result<(), Status> {
+    use alloc::vec::Vec;
+    use uefi::runtime::VariableVendor;
+    use uefi::proto::device_path::DevicePath;
+    use uefi::boot::{OpenProtocolParams, OpenProtocolAttributes};
+
+    info!("Adding HTTP boot entry: {} -> {}", description, url);
+
+    // 1. Get NIC device path
+    let dp_ptr = boot::open_protocol::<DevicePath>(
+        OpenProtocolParams {
+            handle: nic_handle,
+            agent: boot::image_handle(),
+            controller: None,
+        },
+        OpenProtocolAttributes::GetProtocol,
+    ).map_err(|e| {
+        info!("Failed to open DevicePath protocol: {:?}", e.status());
+        e.status()
+    })?;
+    // SAFETY: ScopedProtocol derefs to &DevicePath
+    let dp: &DevicePath = &*dp_ptr;
+    // Find the length of the device path (walk until end node)
+    let mut dp_bytes: Vec<u8> = Vec::new();
+    let mut node_ptr = dp as *const DevicePath as *const u8;
+    loop {
+        let typ = unsafe { *node_ptr };
+        let subtype = unsafe { *node_ptr.add(1) };
+        let len = u16::from_le_bytes([unsafe { *node_ptr.add(2) }, unsafe { *node_ptr.add(3) }]) as usize;
+        dp_bytes.extend_from_slice(unsafe { core::slice::from_raw_parts(node_ptr, len) });
+        if typ == 0x7f && subtype == 0xff { break; }
+        node_ptr = unsafe { node_ptr.add(len) };
+    }
+
+    // 3. Create IPv4 node for DHCP (required between MAC and URI nodes)
+    let mut ipv4_node = Vec::with_capacity(27);
+    ipv4_node.push(0x03);  // Messaging Device Path
+    ipv4_node.push(0x0C);  // IPv4 Device Path
+    ipv4_node.extend_from_slice(&(27u16).to_le_bytes());  // Length = 27 bytes
+    // Local IPv4 address (0.0.0.0 = DHCP assigned)
+    ipv4_node.extend_from_slice(&[0, 0, 0, 0]);
+    // Remote IPv4 address (not used for HTTP boot)
+    ipv4_node.extend_from_slice(&[0, 0, 0, 0]);
+    // Local port (0 = dynamic)
+    ipv4_node.extend_from_slice(&(0u16).to_le_bytes());
+    // Remote port (0 = protocol default)
+    ipv4_node.extend_from_slice(&(0u16).to_le_bytes());
+    // Protocol (6 = TCP for HTTP)
+    ipv4_node.extend_from_slice(&(6u16).to_le_bytes());
+    // Static IP flag (0 = DHCP)
+    ipv4_node.push(0);
+    // Gateway IP address (0.0.0.0 = DHCP assigned)
+    ipv4_node.extend_from_slice(&[0, 0, 0, 0]);
+    // Subnet mask (0.0.0.0 = DHCP assigned)
+    ipv4_node.extend_from_slice(&[0, 0, 0, 0]);
+
+    // 4. Create URI device path node (UEFI HTTP boot: Type 0x03, Subtype 0x18)
+    let uri_bytes = url.as_bytes();
+    let uri_len = uri_bytes.len();
+    let node_len = 4 + uri_len;
+    let mut uri_node = Vec::with_capacity(node_len);
+    uri_node.push(0x03); // Messaging Device Path
+    uri_node.push(0x18); // URI Device Path
+    uri_node.extend_from_slice(&(node_len as u16).to_le_bytes());
+    uri_node.extend_from_slice(uri_bytes);
+    let end_node = [0x7f, 0xff, 0x04, 0x00];
+
+    // 5. Build full device path: NIC device path (excluding its end node) + URI node + end node
+    // Remove the last 4 bytes (end node) from dp_bytes
+    if dp_bytes.len() >= 4 {
+        dp_bytes.truncate(dp_bytes.len() - 4);
+    }
+    let mut device_path: Vec<u8> = Vec::new();
+    device_path.extend_from_slice(&dp_bytes);
+    device_path.extend_from_slice(&ipv4_node);
+    device_path.extend_from_slice(&uri_node);
+    device_path.extend_from_slice(&end_node);
+
+    // 4. Prepare the load option (see UEFI spec for EFI_LOAD_OPTION)
+    // Attributes: ACTIVE (0x00000001)
+    let attributes: u32 = 1;
+    let description_utf16: Vec<u16> = description.encode_utf16().chain(core::iter::once(0)).collect();
+    let file_path_list_length: u16 = device_path.len() as u16;
+    let mut load_option: Vec<u8> = Vec::new();
+    load_option.extend_from_slice(&attributes.to_le_bytes());
+    load_option.extend_from_slice(&file_path_list_length.to_le_bytes());
+    for w in &description_utf16 {
+        load_option.extend_from_slice(&w.to_le_bytes());
+    }
+    load_option.extend_from_slice(&device_path);
+    // No optional data
+
+    // 5. Find a free Boot#### variable
+    let mut boot_num = 0x0001u16;
+    let mut boot_var = format!("Boot{:04X}", boot_num);
+    let mut name_buf = [0u16; 12];
+    while runtime::get_variable(
+        CStr16::from_str_with_buf(&boot_var, &mut name_buf).unwrap(),
+        &VariableVendor::GLOBAL_VARIABLE,
+        &mut [0u8; 4],
+    ).is_ok() {
+        boot_num += 1;
+        boot_var = format!("Boot{:04X}", boot_num);
+    }
+    info!("Using boot variable: {}", boot_var);
+
+    // 6. Set the Boot#### variable
+    let mut name_buf = [0u16; 12];
+    let name = CStr16::from_str_with_buf(&boot_var, &mut name_buf).unwrap();
+    runtime::set_variable(
+        name,
+        &VariableVendor::GLOBAL_VARIABLE,
+        VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
+        &load_option,
+    ).map_err(|e| {
+        info!("Failed to set {}: {:?}", boot_var, e.status());
+        e.status()
+    })?;
+
+    // 7. Add to BootOrder
+    let mut bootorder = [0u16; 128];
+    let mut bootorder_bytes = unsafe {
+        core::slice::from_raw_parts_mut(bootorder.as_mut_ptr() as *mut u8, 128 * 2)
+    };
+    let mut binding = [0u16; 12];
+    let bootorder_name = CStr16::from_str_with_buf("BootOrder", &mut binding).unwrap();
+    let mut order_len = 0;
+    if let Ok((data, _)) = runtime::get_variable(bootorder_name, &VariableVendor::GLOBAL_VARIABLE, &mut bootorder_bytes) {
+        order_len = data.len() / 2;
+        for (i, chunk) in data.chunks_exact(2).enumerate() {
+            bootorder[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+        }
+    }
+    bootorder[order_len] = boot_num;
+    let new_order_bytes = unsafe {
+        core::slice::from_raw_parts(bootorder.as_ptr() as *const u8, (order_len + 1) * 2)
+    };
+    runtime::set_variable(
+        bootorder_name,
+        &VariableVendor::GLOBAL_VARIABLE,
+        VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
+        new_order_bytes,
+    ).map_err(|e| {
+        info!("Failed to update BootOrder: {:?}", e.status());
+        e.status()
+    })?;
+
+    info!("HTTP boot entry added as {}", boot_var);
+    Ok(())
 }
