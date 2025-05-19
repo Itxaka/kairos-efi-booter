@@ -4,10 +4,9 @@ extern crate alloc;
 #[global_allocator]
 static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 
-use alloc::fmt::format;
 use alloc::format;
 use alloc::string::{String, ToString};
-use log::{info, LevelFilter};
+use log::{debug, info, LevelFilter};
 use uefi::prelude::*;
 use uefi::CStr16;
 use uefi::runtime::{self, ResetType, VariableAttributes, VariableVendor};
@@ -16,7 +15,31 @@ use alloc::vec::Vec;
 use uefi::boot;
 use uefi::proto::network::ip4config2::Ip4Config2;
 use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet};
-use uefi::proto::device_path::DevicePath;
+
+
+// This will:
+// 1. Set up the network interface
+// 2. Request DHCP information to find the PXE server
+// 3. Enroll keys if in setup mode
+// 4. Add an HTTP boot entry to the UEFI boot manager
+// 5. Reboot into the Kairos installer
+// 6. If no DHCP server is found, stall for 5 seconds and reset the system
+// 7. If the HTTP boot entry cannot be added, stall for 10 seconds and reset the system
+// 8. If the key enrollment fails, stall for 5 seconds and reset the system
+// 9. If the HTTP download fails, stall for 5 seconds and reset the system
+// 10. If the PK, KEK, or DB enrollment fails, stall for 5 seconds and reset the system
+// 11. If the HTTP download is incomplete, warn the user
+// 12. If the HTTP download fails, warn the user
+
+// Getting the "proper" server to get the keys and add the entry is a bit iffy.
+// We assume that the PXE server is the one that its serving everything as we expect Auroraboot
+// to be the one that is serving the keys and efis. 
+// So we launch a dhcp ack to get the ipxe server, and then we use that to get the keys and the server for
+// the HTTP boot entry.
+// Main problem with this approach is that we leave a Kairos installer entry in there, something that we
+// can probably fix by removing the entry from userspace after the installation is done.
+// Alos we try to set it up as the highest entry in the boot order, so it should be the first one to be selected.
+// but not all firmwares are the same so we dont know if that will work.
 
 
 #[entry]
@@ -54,8 +77,7 @@ unsafe fn main() -> Status {
         if let Err(e) = enroll_all_keys(&server) {
             info!("Key enrollment failed: {:?}", e);
         } else {
-            info!("Keys enrolled. entry created. Rebooting...");
-            runtime::reset(ResetType::COLD, Status::SUCCESS, None);
+            info!("Keys enrolled.");
         }
     } else {
         info!("Not in setup mode, skipping key enrollment");
@@ -64,13 +86,15 @@ unsafe fn main() -> Status {
     // Add HTTP boot entry using the NIC device path
     add_http_boot_entry(
         nic_handle,
-        format!("http://{}/bootx64.efi", server).as_str(),
+        format!("http://{}/kairos.efi", server).as_str(),
         "Kairos installer",
     ).unwrap_or_else(|e| {
         info!("Failed to add HTTP boot entry: {:?}", e);
         boot::stall(10_000_000);
         runtime::reset(ResetType::COLD, Status::ABORTED, None);
     });
+    
+    info!("Boot entry added and keys enrolled. Rebooting into Kairos installer...");
     boot::stall(5_000_000);
     runtime::reset(ResetType::COLD, Status::ABORTED, None);
 }
@@ -225,11 +249,9 @@ fn http_download(url: &str) -> Result<Vec<u8>, Status> {
     // Log headers and look for Content-Length
     let mut content_length: Option<usize> = None;
     for (name, value) in &resp.headers {
-        info!("  {}: {}", name, value);
         if name.to_lowercase() == "content-length" {
             if let Ok(len) = value.parse::<usize>() {
                 content_length = Some(len);
-                info!("Found Content-Length: {} bytes", len);
             }
         }
     }
@@ -252,13 +274,13 @@ fn http_download(url: &str) -> Result<Vec<u8>, Status> {
                 
                 // Log progress if Content-Length is known
                 if let Some(total) = content_length {
-                    info!("Progress: {}/{} bytes ({:.1}%)", 
+                    debug!("Progress: {}/{} bytes ({:.1}%)", 
                           full_body.len(), total, 
                           (full_body.len() as f32 / total as f32) * 100.0);
                     
                     // If we've received all the data, we're done
                     if full_body.len() >= total {
-                        info!("Download complete, received all {} bytes", full_body.len());
+                        debug!("Download complete, received all {} bytes", full_body.len());
                         break;
                     }
                 }
@@ -266,7 +288,7 @@ fn http_download(url: &str) -> Result<Vec<u8>, Status> {
             Err(e) => {
                 // NOT_FOUND typically means no more data is available
                 if e.status() == Status::NOT_FOUND {
-                    info!("No more data available");
+                    debug!("No more data available");
                 } else {
                     info!("Error fetching additional data: {:?}", e);
                 }
@@ -276,7 +298,7 @@ fn http_download(url: &str) -> Result<Vec<u8>, Status> {
         
         // Safety check to prevent infinite loops
         if chunk_count > 50 {
-            info!("Reached maximum chunk count, stopping download");
+            debug!("Reached maximum chunk count, stopping download");
             break;
         }
     }
