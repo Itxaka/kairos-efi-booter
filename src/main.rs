@@ -39,7 +39,7 @@ use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet};
 // Main problem with this approach is that we leave a Kairos installer entry in there, something that we
 // can probably fix by removing the entry from userspace after the installation is done.
 // Alos we try to set it up as the highest entry in the boot order, so it should be the first one to be selected.
-// but not all firmwares are the same so we dont know if that will work.
+// but not all firmwares are the same so we don't know if that will work.
 
 
 #[entry]
@@ -146,9 +146,9 @@ fn enroll_all_keys(server: &str) -> Result<(), Status> {
         }
     };
 
-    enroll_key("PK", &pk)?;
-    enroll_key("KEK", &kek)?;
     enroll_key("db", &db)?;
+    enroll_key("KEK", &kek)?;
+    enroll_key("PK", &pk)?;
     Ok(())
 }
 
