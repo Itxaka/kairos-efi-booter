@@ -508,15 +508,13 @@ unsafe fn add_http_boot_entry(nic_handle: uefi::Handle, url: &str, description: 
                     info!("Boot entry {}: description='{}'", boot_var, desc);
                     if desc == description {
                         info!("Removing duplicate boot entry '{}' as {}", description, boot_var);
-                        match runtime::set_variable(
+                        runtime::delete_variable(
                             name,
                             &VariableVendor::GLOBAL_VARIABLE,
-                            VariableAttributes::empty(),
-                            &mut []
-                        ) {
-                            Ok(_) => {},
-                            Err(e) => info!("Failed to remove boot entry '{}': {:?}", boot_var, e.status()),
-                        }
+                        ).map_err(|e| {
+                            info!("Failed to delete boot entry '{}': {:?}", boot_var, e.status());
+                            e.status()
+                        })?;
                         // Do not break; continue to remove all duplicates
                     }
                 }
@@ -636,6 +634,7 @@ unsafe fn add_http_boot_entry(nic_handle: uefi::Handle, url: &str, description: 
     })?;
 
     // 7. Add to BootOrder
+    // Clean up BootOrder: remove any entries that were deleted above (i.e., with the same description)
     let mut bootorder = [0u16; 128];
     let mut bootorder_bytes = unsafe {
         core::slice::from_raw_parts_mut(bootorder.as_mut_ptr() as *mut u8, 128 * 2)
@@ -649,9 +648,23 @@ unsafe fn add_http_boot_entry(nic_handle: uefi::Handle, url: &str, description: 
             bootorder[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
         }
     }
-    bootorder[order_len] = boot_num;
+    // Remove deleted entries from BootOrder
+    let mut new_order: Vec<u16> = Vec::new();
+    for i in 0..order_len {
+        let boot_num = bootorder[i];
+        let boot_var = format!("Boot{:04X}", boot_num);
+        let mut name_buf = [0u16; 12];
+        let name = CStr16::from_str_with_buf(&boot_var, &mut name_buf).unwrap();
+        let mut buf = [0u8; 4];
+        // Only keep if the variable still exists
+        if runtime::get_variable(name, &VariableVendor::GLOBAL_VARIABLE, &mut buf).is_ok() {
+            new_order.push(boot_num);
+        }
+    }
+    // Add the new entry
+    new_order.push(boot_num);
     let new_order_bytes = unsafe {
-        core::slice::from_raw_parts(bootorder.as_ptr() as *const u8, (order_len + 1) * 2)
+        core::slice::from_raw_parts(new_order.as_ptr() as *const u8, new_order.len() * 2)
     };
     runtime::set_variable(
         bootorder_name,
