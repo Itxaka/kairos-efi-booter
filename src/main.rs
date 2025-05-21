@@ -93,7 +93,7 @@ unsafe fn main() -> Status {
     add_http_boot_entry(
         nic_handle,
         format!("http://{}/kairos.iso", server).as_str(),
-        "Kairos installer",
+        "Kairos",
     ).unwrap_or_else(|e| {
         info!("Failed to add HTTP boot entry: {:?}", e);
         boot::stall(10_000_000);
